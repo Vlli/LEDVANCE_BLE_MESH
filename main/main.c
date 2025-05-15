@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <math.h>
 #include "cJSON.h"
 
 #include "esp_log.h"
@@ -100,17 +101,26 @@ static uint8_t dev_uuid[16] = { 0xcc, 0xcc };
 esp_mqtt_client_handle_t mqtt_client;
 
 static struct example_info_store {
-    uint16_t net_idx;   /* NetKey Index */
-    uint16_t app_idx;   /* AppKey Index */
-    uint8_t  onoff;     /* Remote OnOff */
-    uint8_t  tid;       /* Message TID */
-    uint8_t brightness; /* Lamp Brightness */
+    // Mesh-Netzwerk Parameter
+    uint16_t net_idx;    /* NetKey Index */
+    uint16_t app_idx;    /* AppKey Index */
+    
+    // Gerätestatus
+    uint8_t  onoff;      /* Remote OnOff */
+    uint8_t  tid;        /* Message TID */
+    
+    // Lichtwerte
+    float    hue;        /* 0.0-360.0 Grad */
+    float    saturation; /* 0.0-100.0 % */
+    float    lightness;  /* 0.0-100.0 % (ersetzt brightness) */
 } __attribute__((packed)) store = {
     .net_idx = ESP_BLE_MESH_KEY_UNUSED,
     .app_idx = ESP_BLE_MESH_KEY_UNUSED,
     .onoff = LED_OFF,
     .tid = 0x0,
-    .brightness = 0,
+    .hue = 0.0f,
+    .saturation = 0.0f,
+    .lightness = 0.0f,  // Früher 'brightness'
 };
 
 static nvs_handle_t NVS_HANDLE;
@@ -119,6 +129,7 @@ static const char * NVS_KEY = "onoff_client";
 static esp_ble_mesh_client_t onoff_client;
 static esp_ble_mesh_client_t level_client;
 static esp_ble_mesh_client_t light_client;
+static esp_ble_mesh_client_t hsl_client;
 
 static esp_ble_mesh_cfg_srv_t config_server = {
     .relay = ESP_BLE_MESH_RELAY_DISABLED,
@@ -142,12 +153,14 @@ static esp_ble_mesh_cfg_srv_t config_server = {
 ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_cli_pub, 2 + 1, ROLE_NODE);
 ESP_BLE_MESH_MODEL_PUB_DEFINE(level_cli_pub, 2 + 1, ROLE_NODE);
 ESP_BLE_MESH_MODEL_PUB_DEFINE(light_cli_pub, 2 + 1, ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(hsl_cli_pub, 2 + 1, ROLE_NODE);
 
 static esp_ble_mesh_model_t root_models[] = {
     ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),
     ESP_BLE_MESH_MODEL_GEN_ONOFF_CLI(&onoff_cli_pub, &onoff_client),
     ESP_BLE_MESH_MODEL_GEN_LEVEL_CLI(&level_cli_pub, &level_client),
     ESP_BLE_MESH_MODEL_LIGHT_LIGHTNESS_CLI(&light_cli_pub, &light_client),
+    ESP_BLE_MESH_MODEL_LIGHT_HSL_CLI(&hsl_cli_pub, &hsl_client), // <--- NEU
 };
 
 static esp_ble_mesh_elem_t elements[] = {
@@ -190,8 +203,8 @@ static void mesh_info_restore(void)
     }
 
     if (exist) {
-        ESP_LOGI(TAG, "Restore, net_idx 0x%04x, app_idx 0x%04x, onoff %u, tid 0x%02x, brightness %d",
-            store.net_idx, store.app_idx, store.onoff, store.tid, store.brightness);
+        ESP_LOGI(TAG, "Restore, net_idx 0x%04x, app_idx 0x%04x, onoff %u, tid 0x%02x, brightness %f",
+            store.net_idx, store.app_idx, store.onoff, store.tid, store.lightness);
     }
 }
 
@@ -318,7 +331,7 @@ void ble_mesh_send_gen_brightness_set(int a_brightness, uint16_t a_addr, esp_mqt
     common.msg_role = ROLE_NODE;
 
     set.lightness_set.op_en = false;
-    set.lightness_set.lightness = a_brightness;
+    set.lightness_set.lightness = (uint16_t)(a_brightness * 65535.0 / 100.0);
     set.lightness_set.tid = store.tid++;
 
     err = esp_ble_mesh_light_client_set_state(&common, &set);
@@ -333,11 +346,75 @@ void ble_mesh_send_gen_brightness_set(int a_brightness, uint16_t a_addr, esp_mqt
     char *string = cJSON_PrintUnformatted(root);
     //printf("JSON: %s\n", string);
     esp_mqtt_client_publish(a_client, a_topic, string, 0, 0, 0);
-    ESP_LOGI(TAG, "Set brightness successful");
+    ESP_LOGI(TAG, "Set brightness successful %d", a_brightness);
 
-    store.brightness = a_brightness;
+    store.lightness = a_brightness;
    // store.onoff = !store.onoff;
     mesh_info_store(); /* Store proper mesh info */
+}
+
+void ble_mesh_send_gen_hsl_set(float hsl_hue, float hsl_saturation, float hsl_lightness, uint16_t a_addr, esp_mqtt_client_handle_t a_client, char* a_topic)
+{
+    esp_ble_mesh_light_client_set_state_t set = {0};
+    esp_ble_mesh_client_common_param_t common = {0};
+    esp_err_t err = ESP_OK;
+
+    // 1. Werteskalierung in BLE-Mesh-Format
+    uint16_t hsl_hue_scaled = (uint16_t)(hsl_hue * 65535.0 / 360.0);
+    uint16_t hsl_saturation_scaled = (uint16_t)(hsl_saturation* 65535.0 / 100.0);
+    uint16_t hsl_lightness_scaled = (uint16_t)(hsl_lightness * 65535.0 / 100.0 / 2);
+    ESP_LOGI(TAG, "Values to lamp: Hue: %d Saturation: %d Lightness: %d", hsl_hue_scaled, hsl_saturation_scaled, hsl_lightness_scaled);
+    set.hsl_set.hsl_hue = hsl_hue_scaled;
+    set.hsl_set.hsl_saturation = hsl_saturation_scaled;
+    set.hsl_set.hsl_lightness = hsl_lightness_scaled;
+
+    // 2. Parameter validieren
+    if (hsl_hue < 0 || hsl_hue > 360 || 
+        hsl_saturation < 0 || hsl_saturation > 100 ||
+        hsl_lightness < 0 || hsl_lightness > 100) {
+        ESP_LOGE(TAG, "Invalid HSL values: H=%.1f S=%.1f L=%.1f", 
+                hsl_hue, hsl_saturation, hsl_lightness);
+        return;
+    }
+
+    // 3. BLE-Mesh-Konfiguration (wie ursprünglich)
+    common.opcode = ESP_BLE_MESH_MODEL_OP_LIGHT_HSL_SET_UNACK;
+    common.model = hsl_client.model;
+    common.ctx.net_idx = store.net_idx;
+    common.ctx.app_idx = store.app_idx;
+    common.ctx.addr = a_addr;
+    common.ctx.send_ttl = 10;
+    common.ctx.send_rel = true;
+    common.msg_timeout = 0;
+    common.msg_role = ROLE_NODE;
+
+    set.hsl_set.tid = store.tid++;
+
+    // 4. Befehl senden
+    ESP_LOGI(TAG, "Try to set HSL");
+    err = esp_ble_mesh_light_client_set_state(&common, &set);
+    if (err) {
+        ESP_LOGE(TAG, "Send Light HSL Set Unack failed");
+        return;
+    }
+
+    // 5. MQTT-Status mit Original-Float-Werten
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "state", cJSON_CreateString("ON"));
+    cJSON_AddItemToObject(root, "color", cJSON_CreateObject());
+    cJSON_AddNumberToObject(cJSON_GetObjectItem(root, "color"), "h", hsl_hue);
+    cJSON_AddNumberToObject(cJSON_GetObjectItem(root, "color"), "s", hsl_saturation);
+    cJSON_AddNumberToObject(root, "lightness", hsl_lightness);
+    
+    char *string = cJSON_PrintUnformatted(root);
+    esp_mqtt_client_publish(a_client, a_topic, string, 0, 0, 0);
+    cJSON_Delete(root);
+
+    // 6. Speicherung als Float (für spätere Abfragen)
+    store.hue = hsl_hue;
+    store.saturation = hsl_saturation;
+    store.lightness = hsl_lightness;
+    mesh_info_store();
 }
 
 static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t event,
@@ -372,7 +449,8 @@ static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_ev
 
             cJSON_AddItemToObject(root, "state", cJSON_CreateNumber(onoff_state));
             
-            char ha_topic = "test";
+            char topic_state[100];
+            char *ha_topic = "test";
             bool found = false;
 
             // Iterate through all lamps in NVS
@@ -383,7 +461,6 @@ static void example_ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_ev
                     // Compare lamp address with sender address
                     if (lamp_info.address == sender_addr) {
                         // Match found, set appropriate topic
-                        char topic_state[100];
                         snprintf(topic_state, sizeof(topic_state), "homeassistant/light/%s/state", lamp_info.name);
                         ha_topic = topic_state;
                         found = true;
@@ -485,30 +562,46 @@ typedef struct {
 
 // Function to create MQTT payload dynamically using cJSON
 char *createPayload(const char *variable1, const char *variable2, const char *variable3) {
-    // Create cJSON object dynamically
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) {
         fprintf(stderr, "Failed to create cJSON object\n");
         exit(EXIT_FAILURE);
     }
-    cJSON *ids = NULL;
-    ids = cJSON_CreateArray();
+
+    // Grundlegende Light-Konfiguration
     cJSON_AddItemToObject(root, "name", cJSON_CreateString(variable1));
     cJSON_AddItemToObject(root, "~", cJSON_CreateString(variable2));
     cJSON_AddItemToObject(root, "cmd_t", cJSON_CreateString("~/set"));
     cJSON_AddItemToObject(root, "stat_t", cJSON_CreateString("~/state"));
     cJSON_AddItemToObject(root, "schema", cJSON_CreateString("json"));
+    
+    // Farb- und Helligkeitseinstellungen
     cJSON_AddItemToObject(root, "brightness", cJSON_CreateBool(true));
-    cJSON_AddItemToObject(root, "bri_scl", cJSON_CreateNumber(50));
+    cJSON_AddItemToObject(root, "color_mode", cJSON_CreateBool(true));
+    cJSON_AddItemToObject(root, "bri_scl", cJSON_CreateNumber(100));  // 0-100% Skalierung
+    
+    // Unterstützte Farbmodi (HSL)
+    cJSON *color_modes = cJSON_CreateArray();
+    cJSON_AddItemToArray(color_modes, cJSON_CreateString("hs"));
+    cJSON_AddItemToObject(root, "supported_color_modes", color_modes);
+
+    // Payload-Vorlagen
     cJSON_AddItemToObject(root, "pl_on", cJSON_CreateString("ON"));
     cJSON_AddItemToObject(root, "pl_off", cJSON_CreateString("OFF"));
-    cJSON_AddItemToObject(root, "uniq_id", cJSON_CreateString(variable3));
-    cJSON *dev = cJSON_CreateObject();
     
+    // Geräteinformationen
+    cJSON *dev = cJSON_CreateObject();
     cJSON_AddItemToObject(root, "dev", dev);
+    
+    cJSON *ids = cJSON_CreateArray();
     cJSON_AddItemToArray(ids, cJSON_CreateString(variable3));
     cJSON_AddItemToObject(dev, "ids", ids);
     cJSON_AddItemToObject(dev, "name", cJSON_CreateString("Lamp"));
+    cJSON_AddItemToObject(dev, "mf", cJSON_CreateString("BLE-Mesh"));
+    cJSON_AddItemToObject(dev, "mdl", cJSON_CreateString("HSL-Light"));
+
+    // Unique ID für Home Assistant
+    cJSON_AddItemToObject(root, "uniq_id", cJSON_CreateString(variable3));
 
     char *string = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -592,6 +685,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             
            if (setMessage){
                 //parse received json data
+                ESP_LOGI(TAG, "Within set message block");
                 cJSON *json = cJSON_Parse(event->data);
                 if (json == NULL) 
                 {
@@ -604,8 +698,34 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 // Extract json data
                 cJSON *brightness = cJSON_GetObjectItemCaseSensitive(json, "brightness");
                 cJSON *actstate = cJSON_GetObjectItemCaseSensitive(json, "state");
+                cJSON *color = cJSON_GetObjectItemCaseSensitive(json, "color");
+                if (color) {
+                    cJSON *h = cJSON_GetObjectItemCaseSensitive(color, "h");   // "h" statt "hue"
+                    cJSON *s = cJSON_GetObjectItemCaseSensitive(color, "s");   // "s" statt "saturation"
+                    if (cJSON_IsNumber(h) && cJSON_IsNumber(s)) {
+                        double hue = h->valuedouble;        // 0.0-360.0 Grad
+                        double saturation = s->valuedouble; // 0.0-100.0 %
+                        
+                        // Lightness (Helligkeit) aus root-Objekt
+                        cJSON *brightness = cJSON_GetObjectItemCaseSensitive(json, "brightness");
+                        double lightness = (cJSON_IsNumber(brightness)) ? brightness->valuedouble : store.lightness;
+
+                        // Validierung
+                        if (hue < 0.0 || hue > 360.0 || saturation < 0.0 || saturation > 100.0 || lightness < 0.0 || lightness > 100.0) {
+                            ESP_LOGE(TAG, "Ungültige HSL-Werte: H=%.1f S=%.1f L=%.1f", hue, saturation, lightness);
+                            return;
+                        }
+
+                        // Befehl senden
+                        ble_mesh_send_gen_hsl_set(hue, saturation, lightness, net_addr, client, ha_topic);
+                    }
+                }
+
                 //printf("State: %s\n", actstate->valuestring);
-                if (cJSON_IsNumber(brightness)) {
+                // HSL-Befehl verarbeiten
+
+                else if (cJSON_IsNumber(brightness)) {
+                    ESP_LOGI(TAG, "MQTT Message is for brightness");
                     //printf("brightness: %d\n", brightness->valueint);
                     int bright = brightness->valueint;
                     ble_mesh_send_gen_brightness_set(bright, net_addr, client, ha_topic);
@@ -846,5 +966,3 @@ void app_main(void)
     start_webserver();
     
 }
-
-
